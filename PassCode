@@ -1,0 +1,241 @@
+#include <ntifs.h>
+#include <ntddk.h>
+#include <cstddef>
+#include<wdm.h>
+
+NTKERNELAPI NTSTATUS MmCopyVirtualMemory(_In_ PEPROCESS srcProcess,_In_ PVOID srcAddr,_In_ PEPROCESS dstProcess,	_In_ PVOID dstAddr,	_In_ SIZE_T DataSize,_In_ KPROCESSOR_MODE PreviousMode,_Out_  PSIZE_T RetureSize);
+
+typedef enum
+{
+	MmTagTypeZQSI = 'ISQZ',         //ZwQuerySystemInformation
+}MmTagType;
+
+typedef enum _SYSTEM_INFORMATION_CLASS
+{
+	SystemModuleInformation = 11
+} SYSTEM_INFORMATION_CLASS;
+
+typedef struct _SYSTEM_MODULE_INFORMATION_ENTRY64 {
+	ULONG Reserved[4];
+	PVOID Base;
+	ULONG Size;
+	ULONG Flags;
+	USHORT Index;
+	USHORT Unknown;
+	USHORT LoadCount;
+	USHORT ModuleNameOffset;
+	CHAR ImageName[256];
+} SYSTEM_MODULE_INFORMATION_ENTRY64, * PSYSTEM_MODULE_INFORMATION_ENTRY64;
+
+
+typedef struct _SYSTEM_MODULE_INFORMATION_ENTRY32 {
+	ULONG Reserved[2];
+	PVOID Base;
+	ULONG Size;
+	ULONG Flags;
+	USHORT Index;
+	USHORT Unknown;
+	USHORT LoadCount;
+	USHORT ModuleNameOffset;
+	CHAR ImageName[256];
+} SYSTEM_MODULE_INFORMATION_ENTRY32, * PSYSTEM_MODULE_INFORMATION_ENTRY32;
+
+typedef struct _SYSTEM_MODULE_INFORMATION
+{
+	ULONG Count;//内核中以加载的模块的个数
+#ifdef _AMD64_
+	SYSTEM_MODULE_INFORMATION_ENTRY64 Module[1];
+#else
+	SYSTEM_MODULE_INFORMATION_ENTRY32 Module[1];
+#endif
+
+} SYSTEM_MODULE_INFORMATION, * PSYSTEM_MODULE_INFORMATION;
+
+NTSTATUS  ZwQuerySystemInformation(
+	_In_      SYSTEM_INFORMATION_CLASS SystemInformationClass,
+	_Inout_   PVOID                    SystemInformation,
+	_In_      ULONG                    SystemInformationLength,
+	_Out_opt_ PULONG                   ReturnLength
+);
+
+NTSTATUS kReadProcessMemory(PEPROCESS Process, PVOID lpBaseAddress, PVOID lpBuffer, size_t nSize)
+{
+	PSIZE_T rSize;
+	return MmCopyVirtualMemory(Process, lpBaseAddress, PsGetCurrentProcess(), lpBuffer, nSize, KernelMode, &rSize);
+}
+
+
+NTSTATUS kWriteProcessMemory(PEPROCESS Process, PVOID lpBaseAddress, PVOID lpBuffer, size_t nSize)
+{
+	PSIZE_T rSize;
+	return MmCopyVirtualMemory(PsGetCurrentProcess(), lpBuffer, Process, lpBaseAddress, nSize, KernelMode, &rSize);
+}
+
+NTSTATUS DriverUnload(PDRIVER_OBJECT pDriverObject)
+{
+	return STATUS_SUCCESS;
+}
+NTSTATUS wpm_safe(PVOID address, PVOID buffer, size_t size)
+{
+	PMDL mdl = IoAllocateMdl(address, size, FALSE, FALSE, NULL);
+	if (!mdl) { return STATUS_SUCCESS; }
+
+	MmProbeAndLockPages(mdl, KernelMode, IoReadAccess);
+	void* map = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmNonCached, NULL, FALSE, NormalPagePriority);
+	MmProtectMdlSystemAddress(mdl, PAGE_EXECUTE_READWRITE);
+
+	memcpy(map, buffer, size);
+
+	MmUnmapLockedPages(map, mdl);
+	MmUnlockPages(mdl);
+	IoFreeMdl(mdl);
+
+	return STATUS_SUCCESS;
+}
+
+VOID CHAR_TO_UNICODE_STRING(PCHAR ch, PUNICODE_STRING unicodeBuffer)
+{
+	ANSI_STRING ansiBuffer;
+	UNICODE_STRING buffer_proc;
+	ULONG len = strlen(ch);
+
+	ansiBuffer.Buffer = ch;
+	ansiBuffer.Length = ansiBuffer.MaximumLength = (USHORT)len;
+	RtlAnsiStringToUnicodeString(unicodeBuffer, &ansiBuffer, TRUE);
+
+	DbgPrint("%ansiBuffer = %Z\n", &ansiBuffer);
+	DbgPrint("%unicodeBuffer = %wZ\n", unicodeBuffer);
+
+}
+
+PVOID PrintAllLoadedMoudleByZwQuerySystemInformation(PVOID pBuffer)
+{
+	ULONG ulInfoLength = 0;
+	PVOID addr = 0;
+	NTSTATUS ntStatus = STATUS_UNSUCCESSFUL;
+
+	DbgPrint("【PrintLoadedModule】::【PrintAllLoadedMoudleByZwQuerySystemInformation】Enter.....\r\n");
+	do
+	{
+		ntStatus = ZwQuerySystemInformation(SystemModuleInformation,
+			NULL,
+			NULL,
+			&ulInfoLength);
+		if ((ntStatus == STATUS_INFO_LENGTH_MISMATCH))
+		{
+			pBuffer = ExAllocatePoolWithTag(PagedPool, ulInfoLength, MmTagTypeZQSI);
+			if (pBuffer == NULL)
+			{
+				DbgPrint("【PrintLoadedModule】::【PrintAllLoadedMoudleByZwQuerySystemInformation】Allocate Memory Failed\r\n");
+				break;
+			}
+			ntStatus = ZwQuerySystemInformation(SystemModuleInformation,
+				pBuffer,
+				ulInfoLength,
+				&ulInfoLength);
+			if (!NT_SUCCESS(ntStatus))
+			{
+				DbgPrint("【PrintLoadedModule】::【PrintAllLoadedMoudleByZwQuerySystemInformation】ZwQuerySystemInformation Failed\r\n");
+				break;
+			}
+			PSYSTEM_MODULE_INFORMATION pModuleInformation = (PSYSTEM_MODULE_INFORMATION)pBuffer;
+			if (pModuleInformation)
+			{
+				for (ULONG i = 0; i < pModuleInformation->Count; i++)
+				{
+					UNICODE_STRING ustr = { 0 };
+					ANSI_STRING astr = { 0 };
+					RtlInitAnsiString(&astr, "dump_wmimmc.sys");  // assumes Name is char*
+
+					RtlAnsiStringToUnicodeString(&ustr, &astr, TRUE);
+
+					UNICODE_STRING unicodeBuffer;
+
+					RtlInitUnicodeString(&unicodeBuffer, L"");
+
+					PCHAR pName = pModuleInformation->Module[i].ImageName + pModuleInformation->Module[i].ModuleNameOffset;
+
+					CHAR_TO_UNICODE_STRING(pName, &unicodeBuffer);
+					/*DbgPrint("【PrintLoadedModule】::【PrintAllLoadedMoudleByZwQuerySystemInformation】targetModuleName:%wZ\t\spName:%wZ\r\n",
+						ustr, unicodeBuffer);*/
+					
+					if (0 == RtlCompareUnicodeString(&ustr, &unicodeBuffer, TRUE))
+					{
+						DbgPrint("【PrintLoadedModule】::【PrintAllLoadedMoudleByZwQuerySystemInformation】Image:%-50s\t\tBase:0x%p\r\n",
+							pModuleInformation->Module[i].ImageName, pModuleInformation->Module[i].Base);
+						addr = pModuleInformation->Module[i].Base;
+						DbgPrint("pModuleInformation FUCK YOU ADDR %p", addr);
+					}
+					RtlFreeUnicodeString(&ustr);
+					RtlFreeUnicodeString(&unicodeBuffer);
+				}
+				DbgPrint("【PrintLoadedModule】::【PrintAllLoadedMoudleByZwQuerySystemInformation】共计%d个内核模块!\r\n", pModuleInformation->Count);
+			}
+		}
+	} while (0);
+	if (pBuffer)
+	{
+		ExFreePoolWithTag(pBuffer, MmTagTypeZQSI);
+	}
+
+	DbgPrint("FUCK YOU ADDR %p", addr);
+	return addr;
+}
+
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT pDriverObject, PUNICODE_STRING pRegister)
+{
+
+	/*if (pDriverObject != NULL)
+	{
+		UNREFERENCED_PARAMETER(pDriverObject);
+		UNREFERENCED_PARAMETER(pRegister);*/
+		PVOID pBuffer = NULL;
+		//DbgPrint("Driver Object Address : %p ,Driver PID : %p", __FUNCTION__, &pKbdDriverObject->DeviceObject, PsGetCurrentProcessId());
+		PEPROCESS pProcess;
+		size_t pid = 4;
+		//0x5B30
+		//6F50
+		
+		PVOID addr = PrintAllLoadedMoudleByZwQuerySystemInformation(pBuffer); // 這邊應該可以自動化找的 但是最近沒什麼時間弄這ㄍ
+		PVOID taddr = (LONG64)addr + 0x73B8;
+		PVOID thirdaddr = (LONG64)addr + 0x7452;
+		addr = (LONG64)addr + 0x6FE0; 
+
+		char newValue[] = { 0x48, 0xe9, 0x4c, 0x02, 0x00, 0x00 };
+		char secValue[] = { 0x48, 0xe9 ,0x8C ,0x00 ,0x00 ,0x00 };
+		char thirdValue[] = { 0x48, 0xe9, 0x38, 0x03, 0x00, 0x00 };
+		//char newValue[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+		//wpm_safe(addr, &newValue, sizeof(int));
+		KAPC_STATE apc;
+		NTSTATUS status = PsLookupProcessByProcessId((HANDLE)pid, &pProcess);
+
+		DbgPrintEx(0, 0, "change value: %p\n", addr);
+
+		if (NT_SUCCESS(status))
+		{
+			KeStackAttachProcess(pProcess, &apc);
+			if (&apc != NULL)
+			{
+				//kWriteProcessMemory(PsGetCurrentProcess(), addr, &newValue, sizeof(int));
+				wpm_safe(addr, &newValue, sizeof(newValue));
+				wpm_safe(taddr, &secValue, sizeof(secValue));
+				wpm_safe(thirdaddr, &thirdValue, sizeof(secValue));
+				int readValue = 0;
+				//kReadProcessMemory(PsGetCurrentProcess(), addr, &readValue, sizeof(int));
+
+				//DbgPrintEx(0, 0, "change value: %p\n", addr);
+				KeUnstackDetachProcess(&apc);
+				ObDereferenceObject(pProcess);
+			}
+
+		}
+
+
+		//pDriverObject->DriverUnload = DriverUnload;
+	//}
+	
+	return  STATUS_SUCCESS;
+}
+
+
